@@ -1,0 +1,9 @@
+gradio>=5.0
+python-docx>=1.1
+PyMuPDF>=1.25
+Pillow>=11.0
+httpx>=0.28
+edge-tts>=6.1
+pydub>=0.25
+python-dotenv>=1.0
+groq>=0.4
