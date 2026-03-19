@@ -130,7 +130,21 @@ async def run_pipeline(
             process_chunk_pipeline(chunk, job_id, voice, llm_sem, tts_sem)
             for chunk in chunks
         ]
-        results: list[AudioSegmentInfo] = await asyncio.gather(*tasks)
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Handle exceptions that escaped process_chunk_pipeline
+        results: list[AudioSegmentInfo] = []
+        for i, r in enumerate(raw_results):
+            if isinstance(r, BaseException):
+                logger.error("Chunk %s raised exception: %s", chunks[i].chunk_id, r)
+                results.append(AudioSegmentInfo(
+                    order=chunks[i].order,
+                    audio_path=os.path.join(PROCESSING_DIR, job_id, f"seg_{chunks[i].order:03d}.mp3"),
+                    section_id=chunks[i].section_id,
+                    success=False,
+                ))
+            else:
+                results.append(r)
 
         chunks_failed = sum(1 for r in results if not r.success)
         _progress(0.85, f"{len(chunks)}/{len(chunks)} chunks hoan tat ({chunks_failed} that bai)")

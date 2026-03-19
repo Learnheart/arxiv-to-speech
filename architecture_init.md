@@ -68,7 +68,7 @@ Automated pipeline: nhận file DOCX/PDF → xử lý thông minh mọi loại n
 | # | Mục tiêu | KPI |
 |---|----------|-----|
 | G1 | Tự động hóa 100% doc → audio | Không can thiệp thủ công |
-| G2 | Chi phí gần bằng không | Edge TTS free + Gemini free tier |
+| G2 | Chi phí gần bằng không | Edge TTS free + Groq free tier |
 | G3 | Hỗ trợ đa dạng nội dung | Text, table, image |
 | G4 | Xử lý chấp nhận được | < 15 phút cho tài liệu 50 trang |
 | G5 | Chất lượng nghe được | Giọng tự nhiên, đúng ngữ cảnh |
@@ -118,8 +118,7 @@ graph LR
 
     Web["🌐 External File Server"] -->|"Download DOCX/PDF\n(via URL)"| D2S
 
-    D2S -->|"Image/Table → Text"| Gemini["Gemini Flash API\n(free tier)"]
-    D2S -->|"Fallback LLM"| Claude["Claude Haiku API"]
+    D2S -->|"Image/Table → Text"| Groq["Groq API\n(Llama 4 Maverick)"]
     D2S -->|"Text → Audio"| Edge["Edge TTS\n(free)"]
 
     style D2S fill:#E6F1FB,stroke:#378ADD,stroke-width:2px
@@ -127,8 +126,7 @@ graph LR
 
 External interactions:
 - **External File Server** — download file từ URL do user cung cấp (Google Drive, Dropbox share link, direct link...)
-- **Gemini Flash** — mô tả ảnh + diễn giải bảng (free tier đủ cho personal use)
-- **Claude Haiku** — fallback khi Gemini fail
+- **Groq API** — mô tả ảnh + diễn giải bảng (primary: Llama 4 Maverick, fallback: Llama 4 Scout — cùng provider)
 - **Edge TTS** — TTS tiếng Việt miễn phí, chất lượng tốt
 
 ### 4.2. Application Architecture
@@ -162,7 +160,7 @@ graph TB
     end
 
     UI --> PP
-    EN -->|"async API calls"| ExtLLM["Gemini / Claude"]
+    EN -->|"async API calls"| ExtLLM["Groq API"]
     TTS -->|"async API calls"| ExtTTS["Edge TTS"]
     EN & TTS -.->|"cache read/write"| DB
     PP -.->|"read file"| FS
@@ -281,8 +279,7 @@ async def run_pipeline(chunks: list[Chunk]) -> list[AudioSegment]:
 
 | Resource | Semaphore limit | Lý do |
 |----------|----------------|-------|
-| Gemini API | 5 concurrent | Free tier: 15 RPM → 5 concurrent an toàn |
-| Claude API (fallback) | 2 concurrent | Paid, dùng ít |
+| Groq API | 5 concurrent | Free tier: 30 RPM → 5 concurrent an toàn |
 | Edge TTS | 10 concurrent | Free, không rate limit nghiêm ngặt |
 
 **So sánh hiệu năng (12 chunks, 4 non-text):**
@@ -300,16 +297,11 @@ Không cần Provider Registry pattern phức tạp. Dùng simple config:
 ```python
 # config.py
 LLM_CONFIG = {
-    "vision": {
-        "provider": "gemini",
-        "model": "gemini-2.0-flash",
-        "fallback": "claude-haiku"
-    },
-    "table_narration": {
-        "provider": "gemini",
-        "model": "gemini-2.0-flash",
-        "fallback": "claude-haiku"
-    }
+    "provider": "groq",
+    "model": "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "fallback_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "max_tokens": 2048,
+    "temperature": 0.3,
 }
 
 TTS_CONFIG = {
@@ -332,7 +324,7 @@ AUDIO_CONFIG = {
 }
 
 CONCURRENCY_CONFIG = {
-    "llm_semaphore": 5,          # max concurrent LLM calls (Gemini free: 15 RPM)
+    "llm_semaphore": 5,          # max concurrent LLM calls (Groq free: 30 RPM)
     "tts_semaphore": 10,         # max concurrent TTS calls (Edge TTS: generous)
 }
 
@@ -561,8 +553,7 @@ sequenceDiagram
     participant PL as Pipeline<br/>(asyncio event loop)
     participant SEM as Semaphore(5)
     participant Cache as SQLite Cache
-    participant Gemini as Gemini Flash
-    participant Claude as Claude Haiku<br/>(fallback)
+    participant Groq as Groq API<br/>(Llama 4 Maverick)
     participant TTS as Edge TTS
     participant FS as Local FS
     participant UI as Gradio progress
@@ -591,12 +582,12 @@ sequenceDiagram
         SEM-->>PL: OK
         PL->>Cache: SELECT llm cache
         alt Cache MISS
-            PL->>Gemini: describe_image(bytes, prompt)
+            PL->>Groq: describe_image(bytes, prompt)\n[model: Maverick]
             alt Success
-                Gemini-->>PL: "Biểu đồ doanh thu Q3..."
-            else Fail → retry 3x → fallback
-                PL->>Claude: describe_image(bytes, prompt)
-                Claude-->>PL: description
+                Groq-->>PL: "Biểu đồ doanh thu Q3..."
+            else Fail → retry 3x → fallback model
+                PL->>Groq: describe_image(bytes, prompt)\n[model: Scout]
+                Groq-->>PL: description
             end
             PL->>Cache: INSERT llm cache (TTL 30d)
         end
@@ -613,8 +604,8 @@ sequenceDiagram
         PL->>PL: table_md = table_to_markdown()
         PL->>Cache: SELECT llm cache
         alt Cache MISS
-            PL->>Gemini: narrate_table(table_md, prompt)
-            Gemini-->>PL: "Bảng cho thấy..." ✅
+            PL->>Groq: narrate_table(table_md, prompt)\n[model: Maverick]
+            Groq-->>PL: "Bảng cho thấy..." ✅
             PL->>Cache: INSERT llm cache
         end
         PL->>SEM: release LLM slot
@@ -696,8 +687,8 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant PL as Pipeline
-    participant Svc as External Service\n(Gemini / Edge TTS)
-    participant FB as Fallback\n(Claude Haiku)
+    participant Svc as External Service\n(Groq / Edge TTS)
+    participant FB as Fallback Model\n(Llama 4 Scout)
     participant DB as SQLite
 
     PL->>Svc: API call
@@ -718,10 +709,10 @@ sequenceDiagram
         end
 
         alt All retries exhausted (LLM only)
-            PL->>FB: Try fallback provider
+            PL->>FB: Try fallback model (Scout)
             alt Fallback success
                 FB-->>PL: ✅ Response
-            else No fallback available
+            else Fallback also failed
                 PL->>PL: chunk.status = "failed"\nInsert placeholder text
             end
         end
@@ -762,10 +753,10 @@ sequenceDiagram
 
 | Provider | Model | Use Case | Cost | Vietnamese |
 |----------|-------|----------|------|-----------|
-| Gemini | 2.0 Flash | Image description + Table narration | Free tier: 15 RPM | ✅ |
-| Claude | Haiku 4.5 | Fallback cho cả image lẫn table | ~$0.25/1K tokens | ✅ |
+| Groq | Llama 4 Maverick 17B | Image description + Table narration (primary) | Free tier: 30 RPM | ✅ |
+| Groq | Llama 4 Scout 17B | Fallback cho cả image lẫn table | Free tier: 30 RPM | ✅ |
 
-Chỉ cần 2 providers: 1 primary (free) + 1 fallback (paid, dùng ít). Gemini Flash free tier cho 15 requests/phút — đủ cho personal use.
+Chỉ cần 1 provider (Groq) với 2 models: primary (Maverick) + fallback (Scout). Cả hai đều nằm trong free tier — hoàn toàn miễn phí cho personal use.
 
 ### 6.4. TTS Engine
 
@@ -792,8 +783,7 @@ Default voice: `vi-VN-HoaiMyNeural` — giọng nữ, tự nhiên, rõ ràng.
 | edge-tts | 6.1.x | GPL-3.0 | Microsoft TTS |
 | pydub | 0.25.x | MIT | Audio processing |
 | ffmpeg | 6.x | LGPL | Audio codec (system dep) |
-| google-genai | latest | Apache-2.0 | Gemini API client |
-| anthropic | latest | MIT | Claude API client |
+| groq | latest | Apache-2.0 | Groq API client |
 
 ---
 
@@ -1064,18 +1054,17 @@ Cache hit scenarios:
 
 | Hạng mục | Chi phí | Ghi chú |
 |----------|---------|---------|
-| Gemini Flash | $0 | Free tier: 15 RPM, 1M tokens/day |
+| Groq API (Maverick + Scout) | $0 | Free tier: 30 RPM |
 | Edge TTS | $0 | Free, không rate limit |
-| Claude Haiku (fallback) | ~$0.01–0.05/doc | Chỉ khi Gemini fail |
 | Infrastructure | $0 | Chạy local |
-| **TOTAL/document** | **~$0.00–0.05** | Gần như miễn phí |
+| **TOTAL/document** | **$0** | Hoàn toàn miễn phí |
 
 ### 13.3. Risk Registry
 
 | Risk | Xác suất | Impact | Mitigation |
 |------|----------|--------|------------|
 | Edge TTS policy change | Low | High | Thêm Kokoro local fallback (roadmap) |
-| Gemini free tier limit | Low | Medium | Claude Haiku fallback (~$0.05/doc) |
+| Groq free tier limit | Low | Medium | Fallback model Scout cùng provider, hoặc chuyển sang provider khác |
 | LLM hallucination on images/tables | Medium | Medium | Prompt engineering, review output |
 | Complex PDFs (scanned) | Medium | Medium | Out of scope, OCR in roadmap |
 
@@ -1092,7 +1081,7 @@ gantt
     section Phase 1 — Core (1.5 tuần)
     Document Parser (DOCX + PDF)       :p1a, 2026-03-18, 3d
     Chunker + Classifier               :p1b, after p1a, 2d
-    LLM Enricher (Gemini + fallback)   :p1c, after p1b, 2d
+    LLM Enricher (Groq + fallback)    :p1c, after p1b, 2d
     TTS Synthesizer (Edge TTS)         :p1d, after p1c, 1d
     Audio Stitcher                     :p1e, after p1d, 1d
 
@@ -1125,8 +1114,7 @@ pip install -r requirements.txt
 
 # 3. Tạo .env
 cp .env.example .env
-# Thêm GEMINI_API_KEY (bắt buộc)
-# Thêm ANTHROPIC_API_KEY (optional, cho fallback)
+# Thêm GROQ_API_KEY (bắt buộc)
 
 # 4. Chạy
 python app.py
@@ -1148,14 +1136,13 @@ doc-to-speech/
 │   ├── parser.py               # DocumentParser (DOCX + PDF)
 │   ├── chunker.py              # HeadingAwareChunker
 │   ├── classifier.py           # ContentClassifier (rule-based)
-│   ├── enricher.py             # LLMEnricher (Gemini + fallback)
+│   ├── enricher.py             # LLMEnricher (Groq + fallback model)
 │   ├── synthesizer.py          # TTSSynthesizer (Edge TTS)
 │   └── stitcher.py             # AudioStitcher (pydub)
 │
 ├── llm/
 │   ├── __init__.py
-│   ├── gemini.py               # Gemini Flash client
-│   └── claude.py               # Claude Haiku client (fallback)
+│   └── groq_client.py          # Groq API client (Maverick + Scout fallback)
 │
 ├── utils/
 │   ├── __init__.py
@@ -1184,9 +1171,8 @@ doc-to-speech/
 ### C. Environment Variables
 
 ```bash
-# LLM (bắt buộc ít nhất 1)
-GEMINI_API_KEY=                 # Primary — free tier
-ANTHROPIC_API_KEY=              # Fallback — paid
+# LLM (bắt buộc)
+GROQ_API_KEY=                   # Groq API — free tier
 
 # TTS
 TTS_VOICE=vi-VN-HoaiMyNeural   # Default Vietnamese voice
@@ -1221,7 +1207,7 @@ DATA_DIR=./data
 | Cache | Redis (3 layers) | SQLite table |
 | LLM routing | Provider Registry + 5 strategies | Config dict + if/else |
 | TTS engines | 4 (Edge, Kokoro, OpenAI, ElevenLabs) | 1 (Edge TTS) |
-| LLM providers | 6 (Gemini, Grok, Claude, GPT, DeepSeek, Ollama) | 2 (Gemini + Claude fallback) |
+| LLM providers | 6 (Gemini, Grok, Claude, GPT, DeepSeek, Ollama) | 1 (Groq — Maverick + Scout fallback) |
 | Dev time | 4–6 tuần | 1.5–2 tuần |
 | RAM usage | ~4 GB | ~500 MB |
 | Dependencies | ~20 packages + Docker | ~12 packages |

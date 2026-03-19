@@ -27,148 +27,182 @@ class DocumentElement:
 
 
 def parse_docx(file_bytes: bytes) -> list[DocumentElement]:
-    """Parse DOCX file using python-docx."""
+    """Parse DOCX file using python-docx, iterating body in document order."""
     from docx import Document
-    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.oxml.ns import qn
 
     doc = Document(io.BytesIO(file_bytes))
     elements: list[DocumentElement] = []
     order = 0
 
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
+    # Build lookup maps keyed by XML element identity for O(1) access
+    para_idx = {id(p._element): p for p in doc.paragraphs}
+    table_idx = {id(t._element): t for t in doc.tables}
 
-        style_name = (para.style.name or "").lower()
+    # Iterate body children in actual document order
+    for child in doc.element.body.iterchildren():
+        tag = child.tag
 
-        if "heading" in style_name:
-            # Extract heading level
-            level = 1
-            for i in range(1, 4):
-                if str(i) in style_name:
-                    level = i
-                    break
-            elements.append(DocumentElement(
-                type=ElementType.HEADING,
-                content=text,
-                heading_level=level,
-                order=order,
-            ))
-        else:
-            elements.append(DocumentElement(
-                type=ElementType.PARAGRAPH,
-                content=text,
-                order=order,
-            ))
-        order += 1
+        if tag == qn('w:p'):
+            # ── Paragraph (may contain text and/or inline images) ──
+            para = para_idx.get(id(child))
+            if not para:
+                continue
 
-    # Extract tables
-    for table in doc.tables:
-        rows = []
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            rows.append(cells)
-        if rows:
-            elements.append(DocumentElement(
-                type=ElementType.TABLE,
-                table_data=rows,
-                order=order,
-            ))
-            order += 1
+            text = para.text.strip()
+            style_name = (para.style.name or "").lower()
 
-    # Extract images
-    for rel in doc.part.rels.values():
-        if "image" in rel.reltype:
-            try:
-                image_bytes = rel.target_part.blob
+            if text:
+                if "heading" in style_name:
+                    level = 1
+                    for i in range(1, 4):
+                        if str(i) in style_name:
+                            level = i
+                            break
+                    elements.append(DocumentElement(
+                        type=ElementType.HEADING,
+                        content=text,
+                        heading_level=level,
+                        order=order,
+                    ))
+                else:
+                    elements.append(DocumentElement(
+                        type=ElementType.PARAGRAPH,
+                        content=text,
+                        order=order,
+                    ))
+                order += 1
+
+            # Check for inline images (a:blip) inside this paragraph
+            for blip in child.findall('.//' + qn('a:blip')):
+                rId = blip.get(qn('r:embed'))
+                if rId and rId in doc.part.rels:
+                    rel = doc.part.rels[rId]
+                    if "image" in rel.reltype:
+                        try:
+                            image_data = rel.target_part.blob
+                            elements.append(DocumentElement(
+                                type=ElementType.IMAGE,
+                                image_bytes=image_data,
+                                order=order,
+                            ))
+                            order += 1
+                        except Exception as e:
+                            logger.warning("Failed to extract DOCX image: %s", e)
+
+        elif tag == qn('w:tbl'):
+            # ── Table ──
+            table = table_idx.get(id(child))
+            if not table:
+                continue
+
+            rows = []
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                rows.append(cells)
+            if rows:
                 elements.append(DocumentElement(
-                    type=ElementType.IMAGE,
-                    image_bytes=image_bytes,
+                    type=ElementType.TABLE,
+                    table_data=rows,
                     order=order,
                 ))
                 order += 1
-            except Exception as e:
-                logger.warning("Failed to extract DOCX image: %s", e)
 
-    elements.sort(key=lambda e: e.order)
     logger.info("DOCX parsed: %d elements", len(elements))
     return elements
 
 
 def parse_pdf(file_bytes: bytes) -> list[DocumentElement]:
-    """Parse PDF file using PyMuPDF with font-size heuristic for headings."""
+    """Parse PDF file using PyMuPDF with font-size heuristic for headings.
+
+    All element types (text, images, tables) are collected per page with their
+    Y-position, then sorted so the final order matches the visual layout.
+    """
     import fitz  # PyMuPDF
 
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     elements: list[DocumentElement] = []
     order = 0
+    page_count = len(doc)
 
-    for page_num in range(len(doc)):
+    for page_num in range(page_count):
         page = doc[page_num]
 
-        # Extract text with font info
+        # Collect (y_position, element) tuples — sort by Y at end of page
+        page_elements: list[tuple[float, DocumentElement]] = []
+
+        # ── 1. Text blocks ──
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
 
         for block in blocks:
-            if block["type"] == 0:  # Text block
-                for line in block["lines"]:
-                    text_parts = []
-                    max_font_size = 0
-                    for span in line["spans"]:
-                        text_parts.append(span["text"])
-                        max_font_size = max(max_font_size, span["size"])
+            if block["type"] != 0:  # only text blocks here
+                continue
+            for line in block["lines"]:
+                text_parts = []
+                max_font_size = 0
+                for span in line["spans"]:
+                    text_parts.append(span["text"])
+                    max_font_size = max(max_font_size, span["size"])
 
-                    text = " ".join(text_parts).strip()
-                    if not text:
-                        continue
+                text = " ".join(text_parts).strip()
+                if not text:
+                    continue
 
-                    # Font-size heuristic for headings
-                    if max_font_size > 16:
-                        elements.append(DocumentElement(
-                            type=ElementType.HEADING,
-                            content=text,
-                            heading_level=1,
-                            order=order,
-                        ))
-                    elif max_font_size > 13:
-                        elements.append(DocumentElement(
-                            type=ElementType.HEADING,
-                            content=text,
-                            heading_level=2,
-                            order=order,
-                        ))
-                    elif max_font_size > 11.5:
-                        elements.append(DocumentElement(
-                            type=ElementType.HEADING,
-                            content=text,
-                            heading_level=3,
-                            order=order,
-                        ))
-                    else:
-                        elements.append(DocumentElement(
-                            type=ElementType.PARAGRAPH,
-                            content=text,
-                            order=order,
-                        ))
-                    order += 1
+                line_y = line["bbox"][1]
 
-            elif block["type"] == 1:  # Image block
-                try:
-                    xref = block.get("image", None)
-                    if xref:
-                        img = doc.extract_image(block["image"])
-                        if img:
-                            elements.append(DocumentElement(
-                                type=ElementType.IMAGE,
-                                image_bytes=img["image"],
-                                order=order,
-                            ))
-                            order += 1
-                except Exception as e:
-                    logger.warning("Failed to extract PDF image on page %d: %s", page_num + 1, e)
+                # Font-size heuristic for headings
+                if max_font_size > 16:
+                    elem = DocumentElement(
+                        type=ElementType.HEADING, content=text,
+                        heading_level=1, order=0,
+                    )
+                elif max_font_size > 13:
+                    elem = DocumentElement(
+                        type=ElementType.HEADING, content=text,
+                        heading_level=2, order=0,
+                    )
+                elif max_font_size > 11.5:
+                    elem = DocumentElement(
+                        type=ElementType.HEADING, content=text,
+                        heading_level=3, order=0,
+                    )
+                else:
+                    elem = DocumentElement(
+                        type=ElementType.PARAGRAPH, content=text, order=0,
+                    )
 
-        # Extract tables
+                page_elements.append((line_y, elem))
+
+        # ── 2. Images via page.get_images() (correct xref-based API) ──
+        seen_xrefs: set[int] = set()
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            try:
+                img_data = doc.extract_image(xref)
+                if img_data and img_data.get("image"):
+                    # Determine image Y-position on page
+                    try:
+                        img_rects = page.get_image_rects(xref)
+                        img_y = img_rects[0].y0 if img_rects else 0.0
+                    except Exception:
+                        img_y = 0.0
+
+                    elem = DocumentElement(
+                        type=ElementType.IMAGE,
+                        image_bytes=img_data["image"],
+                        order=0,
+                    )
+                    page_elements.append((img_y, elem))
+            except Exception as e:
+                logger.warning(
+                    "Failed to extract PDF image (xref=%d) on page %d: %s",
+                    xref, page_num + 1, e,
+                )
+
+        # ── 3. Tables ──
         try:
             tables = page.find_tables()
             for table in tables:
@@ -177,18 +211,23 @@ def parse_pdf(file_bytes: bytes) -> list[DocumentElement]:
                     cells = [str(cell) if cell is not None else "" for cell in row]
                     rows.append(cells)
                 if rows:
-                    elements.append(DocumentElement(
-                        type=ElementType.TABLE,
-                        table_data=rows,
-                        order=order,
-                    ))
-                    order += 1
+                    table_y = table.bbox[1]  # top-Y of table bounding box
+                    elem = DocumentElement(
+                        type=ElementType.TABLE, table_data=rows, order=0,
+                    )
+                    page_elements.append((table_y, elem))
         except Exception as e:
             logger.warning("Failed to extract tables from page %d: %s", page_num + 1, e)
 
+        # ── 4. Sort by Y-position and assign sequential order ──
+        page_elements.sort(key=lambda x: x[0])
+        for _, elem in page_elements:
+            elem.order = order
+            elements.append(elem)
+            order += 1
+
     doc.close()
-    elements.sort(key=lambda e: e.order)
-    logger.info("PDF parsed: %d elements from %d pages", len(elements), len(doc))
+    logger.info("PDF parsed: %d elements from %d pages", len(elements), page_count)
     return elements
 
 

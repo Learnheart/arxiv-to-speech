@@ -166,8 +166,7 @@ sequenceDiagram
     participant PC as process_chunk()\n(1 coroutine per chunk)
     participant SEM as Semaphore(5)
     participant Cache as SQLite Cache
-    participant Gemini as Gemini Flash
-    participant Claude as Claude Haiku<br/>(fallback)
+    participant Groq as Groq API<br/>(Llama 4 Maverick)
     participant TTS as Edge TTS
     participant FS as Local FS
 
@@ -185,14 +184,14 @@ sequenceDiagram
             Cache-->>PC: cached description
         else Cache MISS
             PC->>PC: Resize image (max 1024px, < 4MB)
-            PC->>Gemini: describe_image(bytes,\nprompt: "Mô tả hình ảnh cho audiobook...")
+            PC->>Groq: describe_image(bytes,\nprompt: "Mô tả hình ảnh cho audiobook...")\n[model: Maverick]
 
-            alt Gemini ✅
-                Gemini-->>PC: "Biểu đồ doanh thu Q3..."
-            else Gemini ❌ → retry 3x → fallback
-                PC->>Claude: describe_image(bytes, prompt)
-                alt Claude ✅
-                    Claude-->>PC: description
+            alt Groq ✅
+                Groq-->>PC: "Biểu đồ doanh thu Q3..."
+            else Groq ❌ → retry 3x → fallback model
+                PC->>Groq: describe_image(bytes, prompt)\n[model: Scout]
+                alt Groq (Scout) ✅
+                    Groq-->>PC: description
                 else All fail
                     PC->>PC: "[Hình ảnh không thể mô tả]"
                 end
@@ -206,13 +205,13 @@ sequenceDiagram
         PC->>PC: table_md = table_to_markdown(data)
         PC->>Cache: SELECT llm cache WHERE hash=sha256(table+prompt)
         alt Cache MISS
-            PC->>Gemini: narrate_table(table_md,\nprompt: "Diễn giải bảng dữ liệu...")
-            alt Gemini ✅
-                Gemini-->>PC: "Bảng cho thấy doanh thu..."
-            else Fail → fallback
-                PC->>Claude: narrate_table(table_md, prompt)
-                alt Claude ✅
-                    Claude-->>PC: narration
+            PC->>Groq: narrate_table(table_md,\nprompt: "Diễn giải bảng dữ liệu...")\n[model: Maverick]
+            alt Groq ✅
+                Groq-->>PC: "Bảng cho thấy doanh thu..."
+            else Fail → fallback model
+                PC->>Groq: narrate_table(table_md, prompt)\n[model: Scout]
+                alt Groq (Scout) ✅
+                    Groq-->>PC: narration
                 else All fail
                     PC->>PC: Raw readout: "Bảng gồm N hàng..."
                 end
@@ -380,7 +379,7 @@ flowchart TD
     D -->|Yes| E[Wait 2^attempt seconds]
     E --> A
     D -->|No| F{Has fallback?}
-    F -->|Yes| G[Try Claude Haiku]
+    F -->|Yes| G[Try fallback model Scout]
     G --> H{Success?}
     H -->|Yes| C
     H -->|No| I[Use placeholder]
@@ -397,8 +396,8 @@ flowchart TD
 
 | Error type | Handling |
 |-----------|----------|
-| Gemini timeout/429 | Retry 3x exponential backoff → Claude fallback |
-| Claude fail | Placeholder text cho LLM chunks |
+| Groq timeout/429 | Retry 3x exponential backoff → fallback model Scout |
+| Fallback model fail | Placeholder text cho LLM chunks |
 | Edge TTS fail | Retry 3x → silence placeholder |
 | Parse error | Job failed |
 | File corrupt | Reject at validation |
